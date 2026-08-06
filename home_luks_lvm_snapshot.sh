@@ -1,43 +1,49 @@
 #!/bin/bash
+set -euo pipefail
 
 KEEP_DAYS=1
-VG="debian" # LVM volume group we are snapshoting
-LV="home_luks" # Name of LVM-volume to take a snapshot of
-BACKUP_PREFIX="home_luks_snapshot-" # Prefix of snapshot volume name.
-SIZE=25G # Amount of disk space to allocate for the snapshot
+VG="debian"
+LV="home_luks"
+BACKUP_PREFIX="home_luks_snapshot-"
+SIZE="40G"
 
+# Basic logging function
+log() {
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"
+}
 
-# Create new snapshot
 TODAY="$(date +%F)"
-NEW_VOLUME="$BACKUP_PREFIX$TODAY"
-if ! lvs | grep -q -F "$NEW_VOLUME"; then
-    /sbin/lvcreate --size $SIZE --permission r --snapshot "$VG/$LV" --name "$NEW_VOLUME" /dev/disk/by-id/lvm-pv-uuid-qSoZUN-KWIi-ncSJ-5Gva-6GYd-zNmV-qnQ8ub
+NEW_VOLUME="${BACKUP_PREFIX}${TODAY}"
+
+# 1. Create new snapshot
+# Check directly if the exact volume exists rather than grepping all volumes
+if /sbin/lvs "${VG}/${NEW_VOLUME}" >/dev/null 2>&1; then
+    log "Backup already exists: ${NEW_VOLUME}"
 else
-    echo "Backup already exists: $NEW_VOLUME"
+    log "Creating new snapshot: ${NEW_VOLUME}"
+    /sbin/lvcreate --size "${SIZE}" --permission r --snapshot "${VG}/${LV}" --name "${NEW_VOLUME}"
 fi
 
-# Clean old snapshots.
+# 2. Clean old snapshots
+# Calculate the cutoff timestamp (at midnight) to avoid 86400-second DST bugs
+CUTOFF_TS=$(date -d "${TODAY} - ${KEEP_DAYS} days" +%s)
 
-# We need to work around debian bug #659762
-# See: http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=659762
-# We do that by disabling udev while removing snapshots
-if service udev status >/dev/null 2>&1; then
-    UDEV_RUNNING=1
-    service udev stop >/dev/null 2>&1
-else
-    UDEV_RUNNING=0
-fi
-
-lvs -o lv_name --noheadings | sed -n "s@$BACKUP_PREFIX@@p" | while read DATE; do
-    TS_DATE=$(date -d "$DATE" +%s)
-    TS_NOW=$(date +%s)
-    AGE=$(( (TS_NOW - TS_DATE) / 86400))
-    if [ "$AGE" -ge "$KEEP_DAYS" ]; then
-        VOLNAME="$BACKUP_PREFIX$DATE"
-        /sbin/lvremove -f "$VG/$VOLNAME"
+# Use awk to grab just the volume name, ignoring other lvs output
+/sbin/lvs -o lv_name --noheadings "${VG}" | awk '{print $1}' | grep "^${BACKUP_PREFIX}" | while read -r VOLNAME; do
+    
+    # Strip the prefix to isolate the date string
+    DATE_STR="${VOLNAME#$BACKUP_PREFIX}"
+    
+    # Safely attempt to parse the date from the volume name
+    if TS_DATE=$(date -d "${DATE_STR}" +%s 2>/dev/null); then
+        
+        # If the snapshot's date is older than or equal to the cutoff
+        if [ "${TS_DATE}" -le "${CUTOFF_TS}" ]; then
+            log "Removing old snapshot: ${VOLNAME}"
+            # -y confirms the prompt silently
+            /sbin/lvremove -y -f "${VG}/${VOLNAME}"
+        fi
+    else
+        log "Warning: Could not parse a valid date from volume name ${VOLNAME}"
     fi
 done
-
-if [ "$UDEV_RUNNING" = "1" ]; then
-    service udev start >/dev/null 2>&1
-fi
